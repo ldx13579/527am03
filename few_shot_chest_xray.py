@@ -496,17 +496,23 @@ class GraphLabelPropagation(nn.Module):
 
         return W
 
-    def propagate(self, embeddings, initial_labels, labeled_mask):
+    def propagate(self, embeddings, initial_labels, labeled_mask, node_weights=None):
         """
         Run label propagation on the graph.
         Args:
             embeddings: (N, D) all node embeddings
             initial_labels: (N, C) soft label matrix
             labeled_mask: (N,) boolean mask for nodes with known labels
+            node_weights: (N,) per-node propagation strength (minority class boost)
         Returns:
             updated_labels: (N, C) propagated soft labels
         """
         W = self.build_knn_graph(embeddings)
+
+        # Apply per-node weights to boost minority class propagation
+        if node_weights is not None:
+            W = W * node_weights.unsqueeze(1)
+            W = (W + W.t()) / 2  # re-symmetrize
 
         D = W.sum(dim=1)
         D_inv_sqrt = torch.diag(1.0 / (torch.sqrt(D) + 1e-8))
@@ -592,8 +598,8 @@ class PrototypicalNetwork(nn.Module):
                                  unlabeled_view1, unlabeled_view2, n_way):
         """
         Semi-supervised forward with dual-view pseudo-labeling and consistency loss.
-        - Samples passing threshold: confidence-weighted pseudo-labels enrich prototypes
-        - Samples below threshold: KL divergence consistency loss between two views
+        - Samples passing threshold: augmentation-adaptive confidence-weighted pseudo-labels
+        - Samples below threshold: Jensen-Shannon divergence consistency loss
         """
         support_embeddings = self.encoder(support_images)
         query_embeddings = self.encoder(query_images)
@@ -604,7 +610,7 @@ class PrototypicalNetwork(nn.Module):
 
         prototypes_before = self.compute_prototypes(support_embeddings, support_labels, n_way)
 
-        # Encode unlabeled views
+        # Encode unlabeled views (view1 = weak aug, view2 = weak aug with different random seed)
         unlabeled_emb_v1 = self.encoder(unlabeled_view1) * channel_weights.unsqueeze(0)
         unlabeled_emb_v2 = self.encoder(unlabeled_view2) * channel_weights.unsqueeze(0)
 
@@ -622,32 +628,36 @@ class PrototypicalNetwork(nn.Module):
                      (max_probs_v1 > threshold) & \
                      (max_probs_v2 > threshold)
 
-        # Consistency loss for sub-threshold samples (KL divergence between two views)
+        # JS divergence for sub-threshold samples (bounded [0, ln2], no gradient explosion)
         sub_threshold_mask = ~agree_mask
         consistency_loss = torch.tensor(0.0, device=support_images.device)
         if sub_threshold_mask.any():
             p = probs_v1[sub_threshold_mask]
             q = probs_v2[sub_threshold_mask]
-            # Symmetric KL: 0.5 * (KL(p||q) + KL(q||p))
-            kl_pq = F.kl_div(q.log(), p, reduction='batchmean')
-            kl_qp = F.kl_div(p.log(), q, reduction='batchmean')
-            consistency_loss = 0.5 * (kl_pq + kl_qp)
+            m = 0.5 * (p + q)
+            js_div = 0.5 * (F.kl_div(m.log(), p, reduction='batchmean') +
+                            F.kl_div(m.log(), q, reduction='batchmean'))
+            consistency_loss = js_div
 
-        # Enrich prototypes with confidence-weighted pseudo-labeled samples
+        # Enrich prototypes with augmentation-adaptive confidence-weighted pseudo-labels
+        # View1 (first augmentation) treated as weaker -> higher confidence weight
+        # Adaptive weight: w_v1 = 0.6, w_v2 = 0.4 (weaker aug view is more reliable)
+        w_v1, w_v2 = 0.6, 0.4
         prototypes_enriched = prototypes_before.clone()
         pseudo_count = torch.zeros(n_way, device=support_images.device)
 
         if agree_mask.any():
             pseudo_labels = preds_v1[agree_mask]
-            pseudo_confidences = (max_probs_v1[agree_mask] + max_probs_v2[agree_mask]) / 2
-            pseudo_embeddings = (unlabeled_emb_v1[agree_mask] + unlabeled_emb_v2[agree_mask]) / 2
+            # Augmentation-adaptive: weight confidence by view reliability
+            pseudo_confidences = w_v1 * max_probs_v1[agree_mask] + w_v2 * max_probs_v2[agree_mask]
+            # Embedding also weighted by augmentation strength
+            pseudo_embeddings = w_v1 * unlabeled_emb_v1[agree_mask] + w_v2 * unlabeled_emb_v2[agree_mask]
 
             for i in range(n_way):
                 cls_mask = pseudo_labels == i
                 if cls_mask.any():
                     n_support = (support_labels == i).sum().float()
                     pseudo_count[i] = cls_mask.sum().float()
-                    # Confidence-weighted: each pseudo sample's weight = its confidence
                     cls_confidences = pseudo_confidences[cls_mask]
                     cls_embeddings = pseudo_embeddings[cls_mask]
                     weighted_pseudo_sum = (cls_embeddings * cls_confidences.unsqueeze(1)).sum(dim=0)
@@ -673,8 +683,8 @@ class PrototypicalNetwork(nn.Module):
                                         unlabeled_view1, unlabeled_view2, n_way):
         """
         Forward with graph-based label propagation.
-        Support nodes are included as known-label anchors; query and unlabeled
-        sets are unknown nodes whose labels are propagated from support.
+        Support nodes are included as known-label anchors with class-balanced weights;
+        query and unlabeled sets are unknown nodes propagated from support.
         """
         support_embeddings = self.encoder(support_images)
         query_embeddings = self.encoder(query_images)
@@ -685,16 +695,31 @@ class PrototypicalNetwork(nn.Module):
 
         prototypes = self.compute_prototypes(support_embeddings, support_labels, n_way)
 
-        # Encode unlabeled (average of two views)
+        # Encode unlabeled (augmentation-adaptive: weak view weighted higher)
         unlabeled_emb_v1 = self.encoder(unlabeled_view1) * channel_weights.unsqueeze(0)
         unlabeled_emb_v2 = self.encoder(unlabeled_view2) * channel_weights.unsqueeze(0)
-        unlabeled_emb = (unlabeled_emb_v1 + unlabeled_emb_v2) / 2
+        unlabeled_emb = 0.6 * unlabeled_emb_v1 + 0.4 * unlabeled_emb_v2
 
         # Build combined node set: [support | query | unlabeled]
         n_support = support_embeddings.size(0)
         n_query = query_embeddings.size(0)
         n_unlabeled = unlabeled_emb.size(0)
         all_embeddings = torch.cat([support_embeddings, query_embeddings, unlabeled_emb], dim=0)
+
+        # Class-balanced node weights: minority classes get higher propagation weight
+        class_counts = torch.zeros(n_way, device=support_images.device)
+        for i in range(n_way):
+            class_counts[i] = (support_labels == i).sum().float()
+        max_count = class_counts.max()
+        # Inverse frequency: weight = max_count / count (minority gets boosted)
+        class_balance_weights = max_count / (class_counts + 1e-8)
+
+        # Assign per-node weights: support nodes get class-balance weight,
+        # query/unlabeled get weight=1.0
+        node_weights = torch.ones(n_support + n_query + n_unlabeled, device=support_images.device)
+        for i in range(n_support):
+            cls_idx = support_labels[i].item()
+            node_weights[i] = class_balance_weights[cls_idx]
 
         # Initial labels: support nodes get one-hot ground-truth labels (known)
         support_onehot = torch.zeros(n_support, n_way, device=support_images.device)
@@ -711,9 +736,9 @@ class PrototypicalNetwork(nn.Module):
         labeled_mask = torch.zeros(n_support + n_query + n_unlabeled, dtype=torch.bool, device=support_images.device)
         labeled_mask[:n_support] = True
 
-        # Graph propagation
+        # Graph propagation with class-balanced node weights
         propagated_labels = self.graph_propagation.propagate(
-            all_embeddings, initial_labels, labeled_mask
+            all_embeddings, initial_labels, labeled_mask, node_weights=node_weights
         )
 
         # Use propagated labels on unlabeled nodes to update prototypes (confidence-weighted)
@@ -731,7 +756,6 @@ class PrototypicalNetwork(nn.Module):
                 cls_mask = confident_labels == i
                 if cls_mask.any():
                     n_sup = (support_labels == i).sum().float()
-                    # Confidence-weighted: weight = prediction confidence
                     cls_confidences = confident_probs[cls_mask]
                     cls_embeddings = confident_emb[cls_mask]
                     weighted_sum = (cls_embeddings * cls_confidences.unsqueeze(1)).sum(dim=0)
@@ -745,7 +769,6 @@ class PrototypicalNetwork(nn.Module):
         query_propagated = propagated_labels[n_support:n_support + n_query]
         distances = self.distance(query_embeddings, prototypes_updated)
         dist_logits = -distances
-        # Combine distance-based logits with propagated soft labels
         combined_logits = dist_logits + query_propagated
         return combined_logits
 
@@ -1341,7 +1364,7 @@ def main():
     print(f"  Semi-supervised accuracy: {semi_acc * 100:.2f}% ± {semi_ci * 100:.2f}%")
     print(f"  Pseudo-labels selected: {pseudo_stats['n_selected']}/{pseudo_stats['n_total']} "
           f"(rate: {pseudo_stats['selection_rate']*100:.1f}%)")
-    print(f"  Consistency loss (KL, sub-threshold): {pseudo_stats['avg_consistency_loss']:.4f}")
+    print(f"  Consistency loss (JS divergence, sub-threshold): {pseudo_stats['avg_consistency_loss']:.4f}")
     print()
 
     # [6/7] Graph Propagation Evaluation
