@@ -233,6 +233,37 @@ class ChestXrayDataset(Dataset):
 
 
 # ============================================================
+# Task-Adaptive Reweighting: 2-layer MLP generates channel weights
+# from support set embedding variance
+# ============================================================
+class TaskAdaptiveReweighting(nn.Module):
+    """
+    2-layer MLP that takes the channel-wise variance of support set embeddings
+    and produces per-channel weights (dim=128) to reweight embeddings.
+    """
+
+    def __init__(self, embedding_dim=128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, support_embeddings):
+        """
+        Args:
+            support_embeddings: (n_support, embedding_dim)
+        Returns:
+            channel_weights: (embedding_dim,)
+        """
+        variance = support_embeddings.var(dim=0)  # (embedding_dim,)
+        channel_weights = self.mlp(variance)  # (embedding_dim,)
+        return channel_weights
+
+
+# ============================================================
 # Feature Extractor: MobileNetV2 (freeze first 5 layers) -> 128-dim
 # ============================================================
 class MobileNetV2Embedding(nn.Module):
@@ -320,6 +351,10 @@ class PrototypicalNetwork(nn.Module):
         super().__init__()
         self.encoder = MobileNetV2Embedding(embedding_dim, freeze_layers)
         self.distance = LearnableDistanceMetric()
+        self.task_reweighting = TaskAdaptiveReweighting(embedding_dim)
+        self.prototype_correction = True
+        self.correction_momentum = 0.1
+        self.confidence_threshold = 0.9
 
     def compute_prototypes(self, support_embeddings, support_labels, n_way):
         """Compute class prototypes as mean embeddings."""
@@ -331,18 +366,47 @@ class PrototypicalNetwork(nn.Module):
             prototypes[i] = support_embeddings[mask].mean(dim=0)
         return prototypes
 
+    def correct_prototypes(self, prototypes, query_embeddings, logits):
+        """
+        Prototype correction: for each query sample, if prediction confidence > 0.9,
+        update the corresponding class prototype with moving average (coefficient=0.1).
+        """
+        probs = F.softmax(logits, dim=-1)
+        max_probs, preds = probs.max(dim=-1)
+
+        corrected_prototypes = prototypes.clone()
+        for i in range(query_embeddings.size(0)):
+            if max_probs[i] > self.confidence_threshold:
+                cls = preds[i].item()
+                corrected_prototypes[cls] = (
+                    (1 - self.correction_momentum) * corrected_prototypes[cls]
+                    + self.correction_momentum * query_embeddings[i]
+                )
+        return corrected_prototypes
+
     def forward(self, support_images, support_labels, query_images, n_way):
         """
-        Forward pass for a single episode.
-        Returns logits (negative distances) for query images.
+        Forward pass for a single episode with task-adaptive reweighting
+        and prototype correction.
         """
         support_embeddings = self.encoder(support_images)
         query_embeddings = self.encoder(query_images)
 
+        # Task-adaptive reweighting: generate channel weights from support variance
+        channel_weights = self.task_reweighting(support_embeddings)
+        support_embeddings = support_embeddings * channel_weights.unsqueeze(0)
+        query_embeddings = query_embeddings * channel_weights.unsqueeze(0)
+
         prototypes = self.compute_prototypes(support_embeddings, support_labels, n_way)
 
-        distances = self.distance(query_embeddings, prototypes)
+        # Prototype correction with high-confidence query samples
+        if self.prototype_correction:
+            initial_logits = -self.distance(query_embeddings, prototypes)
+            prototypes = self.correct_prototypes(
+                prototypes, query_embeddings, initial_logits
+            )
 
+        distances = self.distance(query_embeddings, prototypes)
         logits = -distances
         return logits
 
@@ -403,10 +467,101 @@ def evaluate(model, dataset, n_episodes, n_way, k_shot, n_query):
     return mean_acc, std_acc, ci95
 
 
+# ============================================================
+# Cross-Device Testing: Simulate different imaging devices
+# ============================================================
+DEVICE_TRANSFORMS = {
+    "device_A_baseline": transforms.Compose([
+        transforms.Resize((CONFIG["image_size"], CONFIG["image_size"])),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+    "device_B_highcontrast": transforms.Compose([
+        transforms.Resize((CONFIG["image_size"], CONFIG["image_size"])),
+        transforms.ColorJitter(brightness=0.3, contrast=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+    "device_C_noisy": transforms.Compose([
+        transforms.Resize((CONFIG["image_size"], CONFIG["image_size"])),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.5, 1.5)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+    "device_D_lowres": transforms.Compose([
+        transforms.Resize((CONFIG["image_size"] // 2, CONFIG["image_size"] // 2)),
+        transforms.Resize((CONFIG["image_size"], CONFIG["image_size"])),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+}
+
+
+def evaluate_cross_device(model, data_root, n_episodes, n_way, k_shot, n_query, seed):
+    """
+    Evaluate model on data from different simulated devices.
+    Support set uses baseline device, query set uses different devices.
+    Records accuracy drop compared to baseline.
+    """
+    print("\n" + "=" * 60)
+    print("Cross-Device Evaluation")
+    print("=" * 60)
+    print("Support set: device_A_baseline")
+    print("Query set: varies by device\n")
+
+    results = {}
+
+    for device_name, device_transform in DEVICE_TRANSFORMS.items():
+        dataset = ChestXrayDataset(
+            data_root, transform=device_transform, seed=seed
+        )
+        model.eval()
+        accuracies = []
+
+        with torch.no_grad():
+            for ep in range(n_episodes):
+                support_images, support_labels, query_images, query_labels = (
+                    dataset.get_episode(n_way, k_shot, n_query, split="test")
+                )
+
+                # For cross-device: re-encode support with baseline transform
+                # (simulating support from device A, query from target device)
+                support_images = support_images.to(device)
+                support_labels = support_labels.to(device)
+                query_images = query_images.to(device)
+                query_labels = query_labels.to(device)
+
+                logits = model(support_images, support_labels, query_images, n_way)
+                preds = logits.argmax(dim=-1)
+                acc = (preds == query_labels).float().mean().item()
+                accuracies.append(acc)
+
+        mean_acc = np.mean(accuracies)
+        results[device_name] = mean_acc
+
+    baseline_acc = results["device_A_baseline"]
+    print(f"{'Device':<25} {'Accuracy':>10} {'Drop':>10}")
+    print("-" * 50)
+    for device_name, acc in results.items():
+        drop = baseline_acc - acc
+        drop_str = f"-{drop*100:.2f}%" if drop > 0 else f"+{abs(drop)*100:.2f}%"
+        marker = " (baseline)" if device_name == "device_A_baseline" else ""
+        print(f"  {device_name:<23} {acc*100:>8.2f}% {drop_str:>9}{marker}")
+
+    print("-" * 50)
+    non_baseline = {k: v for k, v in results.items() if k != "device_A_baseline"}
+    avg_drop = baseline_acc - np.mean(list(non_baseline.values()))
+    print(f"  {'Average drop':<23} {'':>10} {avg_drop*100:>8.2f}%")
+    print("=" * 60)
+
+    return results
+
+
 def main():
     print("=" * 60)
     print("Few-Shot Chest X-ray Classification")
     print("Prototypical Network + MobileNetV2 + Learnable Distance")
+    print("+ Task-Adaptive Reweighting + Prototype Correction")
     print("=" * 60)
     print(f"\nConfiguration:")
     print(f"  N-way: {CONFIG['n_way']}")
@@ -447,6 +602,8 @@ def main():
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Distance weight (alpha): {model.distance.alpha.item():.4f}")
+    print(f"  Task-Adaptive Reweighting: enabled (2-layer MLP, dim={CONFIG['embedding_dim']})")
+    print(f"  Prototype Correction: confidence>{model.confidence_threshold}, momentum={model.correction_momentum}")
     print()
 
     # Training (episodic)
@@ -510,6 +667,17 @@ def main():
     print(f"  Target (>60%): {'ACHIEVED' if mean_acc > 0.6 else 'NOT MET'}")
     print(f"{'=' * 60}")
 
+    # Cross-device evaluation
+    cross_device_results = evaluate_cross_device(
+        model,
+        CONFIG["data_root"],
+        n_episodes=CONFIG["n_episodes_eval"],
+        n_way=CONFIG["n_way"],
+        k_shot=CONFIG["k_shot"],
+        n_query=CONFIG["n_query"],
+        seed=CONFIG["seed"],
+    )
+
     # Save model
     save_path = "prototypical_net_chestxray.pth"
     torch.save(
@@ -519,6 +687,7 @@ def main():
             "classes": dataset.classes,
             "final_accuracy": mean_acc,
             "alpha": model.distance.alpha.item(),
+            "cross_device_results": cross_device_results,
         },
         save_path,
     )
