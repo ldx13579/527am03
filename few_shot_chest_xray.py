@@ -251,15 +251,28 @@ class TaskAdaptiveReweighting(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, support_embeddings):
+    def forward(self, support_embeddings, support_labels, n_way):
         """
+        Per-class variance aggregation: group support embeddings by class,
+        compute each class's channel-wise variance, then average across classes.
+
         Args:
             support_embeddings: (n_support, embedding_dim)
+            support_labels: (n_support,)
+            n_way: number of classes
         Returns:
             channel_weights: (embedding_dim,)
         """
-        variance = support_embeddings.var(dim=0)  # (embedding_dim,)
-        channel_weights = self.mlp(variance)  # (embedding_dim,)
+        class_variances = []
+        for i in range(n_way):
+            mask = support_labels == i
+            class_emb = support_embeddings[mask]
+            if class_emb.size(0) > 1:
+                class_variances.append(class_emb.var(dim=0))
+            else:
+                class_variances.append(torch.zeros_like(support_embeddings[0]))
+        aggregated_variance = torch.stack(class_variances).mean(dim=0)
+        channel_weights = self.mlp(aggregated_variance)
         return channel_weights
 
 
@@ -368,15 +381,23 @@ class PrototypicalNetwork(nn.Module):
 
     def correct_prototypes(self, prototypes, query_embeddings, logits):
         """
-        Prototype correction: for each query sample, if prediction confidence > 0.9,
-        update the corresponding class prototype with moving average (coefficient=0.1).
+        Prototype correction with nearest-neighbor consistency filtering:
+        For each query, only update prototype if BOTH conditions are met:
+          1. Prediction confidence > threshold (0.9)
+          2. Predicted class matches the nearest-neighbor prototype class
+        This reduces pollution from false high-confidence samples.
         """
         probs = F.softmax(logits, dim=-1)
         max_probs, preds = probs.max(dim=-1)
 
+        # Compute nearest-neighbor class for each query (minimum L2 distance)
+        diffs = query_embeddings.unsqueeze(1) - prototypes.unsqueeze(0)
+        nn_dists = (diffs ** 2).sum(dim=-1)
+        nn_classes = nn_dists.argmin(dim=-1)
+
         corrected_prototypes = prototypes.clone()
         for i in range(query_embeddings.size(0)):
-            if max_probs[i] > self.confidence_threshold:
+            if max_probs[i] > self.confidence_threshold and preds[i] == nn_classes[i]:
                 cls = preds[i].item()
                 corrected_prototypes[cls] = (
                     (1 - self.correction_momentum) * corrected_prototypes[cls]
@@ -392,8 +413,8 @@ class PrototypicalNetwork(nn.Module):
         support_embeddings = self.encoder(support_images)
         query_embeddings = self.encoder(query_images)
 
-        # Task-adaptive reweighting: generate channel weights from support variance
-        channel_weights = self.task_reweighting(support_embeddings)
+        # Task-adaptive reweighting: per-class variance aggregation
+        channel_weights = self.task_reweighting(support_embeddings, support_labels, n_way)
         support_embeddings = support_embeddings * channel_weights.unsqueeze(0)
         query_embeddings = query_embeddings * channel_weights.unsqueeze(0)
 
